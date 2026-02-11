@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import gradio as gr
@@ -7,6 +8,8 @@ import numpy as np
 from PIL import Image, ImageColor, ImageFilter, ImageOps
 
 MAX_IMAGE_SIZE = 1600
+ART_LIBRARY_DIR = Path("art_library")
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
 @dataclass
@@ -16,16 +19,37 @@ class ArtItem:
     tags: Tuple[str, ...]
 
 
-ART_LIBRARY: List[ArtItem] = [
-    ArtItem("bird.webp", "Rainforest Bird", ("bird", "nature", "wildlife", "green", "tropical")),
-    ArtItem("cat_window.webp", "Cat in Window Light", ("cat", "pet", "home", "cozy", "window")),
-    ArtItem("person1.webp", "Portrait Sketch", ("portrait", "person", "minimal", "fashion")),
-    ArtItem("woman1.webp", "Modern Female Portrait", ("portrait", "woman", "modern", "editorial")),
-    ArtItem("woman2.webp", "Elegant Profile", ("portrait", "woman", "elegant", "soft")),
-]
-
-
 WORD_RE = re.compile(r"[a-zA-Z0-9']+")
+
+
+def title_from_filename(image_path: Path) -> str:
+    return image_path.stem.replace("_", " ").replace("-", " ").title()
+
+
+def tags_from_filename(image_path: Path) -> Tuple[str, ...]:
+    tokens = [token.lower() for token in WORD_RE.findall(image_path.stem)]
+    return tuple(sorted(set(tokens)))
+
+
+def build_art_library(folder: Path) -> List[ArtItem]:
+    if not folder.exists():
+        return []
+
+    items: List[ArtItem] = []
+    for image_path in sorted(folder.iterdir()):
+        if image_path.is_file() and image_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+            items.append(
+                ArtItem(
+                    path=str(image_path),
+                    title=title_from_filename(image_path),
+                    tags=tags_from_filename(image_path),
+                )
+            )
+
+    return items
+
+
+ART_LIBRARY = build_art_library(ART_LIBRARY_DIR)
 
 
 def load_rgb_image(path: str) -> Image.Image:
@@ -71,6 +95,9 @@ def choose_frame_palette(wall_stats: Dict[str, np.ndarray]) -> Dict[str, str]:
 
 
 def score_art(prompt: str, wall_image: Image.Image) -> Tuple[ArtItem, Dict[str, float]]:
+    if not ART_LIBRARY:
+        raise gr.Error(f"No artworks found in '{ART_LIBRARY_DIR}'. Add image files to continue.")
+
     wall_stats = image_stats(wall_image)
     prompt_tokens = tokenize(prompt)
 
@@ -199,9 +226,9 @@ def infer(prompt: str, wall_photo: Image.Image):
 
 
 EXAMPLES = [
-    ["I want a cozy pet-themed picture that feels warm and homely", "cat_window.webp"],
-    ["Give me a tropical wildlife piece with vibrant nature colors", "bird.webp"],
-    ["I need an elegant modern portrait for a stylish interior wall", "woman2.webp"],
+    ["I want a cozy pet-themed picture that feels warm and homely", "art_library/cat_window.webp"],
+    ["Give me a tropical wildlife piece with vibrant nature colors", "art_library/bird.webp"],
+    ["I need an elegant modern portrait for a stylish interior wall", "art_library/woman2.webp"],
 ]
 
 
@@ -249,3 +276,4 @@ generates a fitting frame style, and places it on your wall preview.
         )
 
 demo.launch()
+
