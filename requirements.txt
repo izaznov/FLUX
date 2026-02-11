@@ -1,0 +1,9 @@
+git+https://github.com/huggingface/diffusers.git@cb9f124657ee2107ec9a4901b823a427e0fd6468
+torch==2.8.0
+transformers
+accelerate
+safetensors
+bitsandbytes
+torchao
+kernels
+tqdm==4.67.1
