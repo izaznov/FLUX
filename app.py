@@ -1,368 +1,278 @@
-import os
-import subprocess
-import sys
-import io
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
 import gradio as gr
 import numpy as np
-import random
-import spaces
-import torch
-from diffusers import Flux2Pipeline, Flux2Transformer2DModel
-from diffusers import BitsAndBytesConfig as DiffBitsAndBytesConfig
-import requests
-from PIL import Image
-import json
-import base64
-from huggingface_hub import InferenceClient
+from PIL import Image, ImageColor, ImageFilter, ImageOps
 
-dtype = torch.bfloat16
-device = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_IMAGE_SIZE = 1600
+ART_LIBRARY_DIR = Path("art_library")
+SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
-MAX_SEED = np.iinfo(np.int32).max
-MAX_IMAGE_SIZE = 1024
 
-hf_client = InferenceClient(
-    api_key=os.environ.get("HF_TOKEN"),
-)
-VLM_MODEL = "baidu/ERNIE-4.5-VL-424B-A47B-Base-PT"
+@dataclass
+class ArtItem:
+    path: str
+    title: str
+    tags: Tuple[str, ...]
 
-SYSTEM_PROMPT_TEXT_ONLY = """You are an expert prompt engineer for FLUX.2 by Black Forest Labs. Rewrite user prompts to be more descriptive while strictly preserving their core subject and intent.
 
-Guidelines:
-1. Structure: Keep structured inputs structured (enhance within fields). Convert natural language to detailed paragraphs.
-2. Details: Add concrete visual specifics - form, scale, textures, materials, lighting (quality, direction, color), shadows, spatial relationships, and environmental context.
-3. Text in Images: Put ALL text in quotation marks, matching the prompt's language. Always provide explicit quoted text for objects that would contain text in reality (signs, labels, screens, etc.) - without it, the model generates gibberish.
+WORD_RE = re.compile(r"[a-zA-Z0-9']+")
 
-Output only the revised prompt and nothing else."""
 
-SYSTEM_PROMPT_WITH_IMAGES = """You are FLUX.2 by Black Forest Labs, an image-editing expert. You convert editing requests into one concise instruction (50-80 words, ~30 for brief requests).
+def title_from_filename(image_path: Path) -> str:
+    return image_path.stem.replace("_", " ").replace("-", " ").title()
 
-Rules:
-- Single instruction only, no commentary
-- Use clear, analytical language (avoid "whimsical," "cascading," etc.)
-- Specify what changes AND what stays the same (face, lighting, composition)
-- Reference actual image elements
-- Turn negatives into positives ("don't change X" → "keep X")
-- Make abstractions concrete ("futuristic" → "glowing cyan neon, metallic panels")
-- Keep content PG-13
 
-Output only the final instruction in plain text and nothing else."""
+def tags_from_filename(image_path: Path) -> Tuple[str, ...]:
+    tokens = [token.lower() for token in WORD_RE.findall(image_path.stem)]
+    return tuple(sorted(set(tokens)))
 
-def remote_text_encoder(prompts):
-    from gradio_client import Client
-    
-    client = Client("multimodalart/mistral-text-encoder")
-    result = client.predict(
-        prompt=prompts,
-        api_name="/encode_text"
-    )
-    
-    # Load returns a tensor, usually on CPU by default
-    prompt_embeds = torch.load(result[0])
-    return prompt_embeds
 
-# Load model
-repo_id = "black-forest-labs/FLUX.2-dev"
+def build_art_library(folder: Path) -> List[ArtItem]:
+    if not folder.exists():
+        return []
 
-dit = Flux2Transformer2DModel.from_pretrained(
-    repo_id,
-    subfolder="transformer",
-    torch_dtype=torch.bfloat16
-)
+    items: List[ArtItem] = []
+    for image_path in sorted(folder.iterdir()):
+        if image_path.is_file() and image_path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+            items.append(
+                ArtItem(
+                    path=str(image_path),
+                    title=title_from_filename(image_path),
+                    tags=tags_from_filename(image_path),
+                )
+            )
 
-pipe = Flux2Pipeline.from_pretrained(
-    repo_id,
-    text_encoder=None,
-    transformer=dit,
-    torch_dtype=torch.bfloat16
-)
-pipe.to(device)
+    return items
 
-# Pull pre-compiled Flux2 Transformer blocks from HF hub
-spaces.aoti_blocks_load(pipe.transformer, "zerogpu-aoti/FLUX.2", variant="fa3")
 
-def image_to_data_uri(img):
-    buffered = io.BytesIO()
-    img.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{img_str}"
+ART_LIBRARY = build_art_library(ART_LIBRARY_DIR)
 
-def upsample_prompt_logic(prompt, image_list):
-    try:
-        if image_list and len(image_list) > 0:
-            # Image + Text Editing Mode
-            system_content = SYSTEM_PROMPT_WITH_IMAGES
-            
-            # Construct user message with text and images
-            user_content = [{"type": "text", "text": prompt}]
-            
-            for img in image_list:
-                data_uri = image_to_data_uri(img)
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": data_uri}
-                })
-                
-            messages = [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content}
-            ]
-        else:
-            # Text Only Mode
-            system_content = SYSTEM_PROMPT_TEXT_ONLY
-            messages = [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": prompt}
-            ]
 
-        completion = hf_client.chat.completions.create(
-            model=VLM_MODEL,
-            messages=messages,
-            max_tokens=1024
-        )
-        
-        return completion.choices[0].message.content
-    except Exception as e:
-        print(f"Upsampling failed: {e}")
-        return prompt
+def load_rgb_image(path: str) -> Image.Image:
+    return Image.open(path).convert("RGB")
 
-def update_dimensions_from_image(image_list):
-    """Update width/height sliders based on uploaded image aspect ratio.
-    Keeps one side at 1024 and scales the other proportionally, with both sides as multiples of 8."""
-    if image_list is None or len(image_list) == 0:
-        return 1024, 1024  # Default dimensions
-    
-    # Get the first image to determine dimensions
-    img = image_list[0][0]  # Gallery returns list of tuples (image, caption)
-    img_width, img_height = img.size
-    
-    aspect_ratio = img_width / img_height
-    
-    if aspect_ratio >= 1:  # Landscape or square
-        new_width = 1024
-        new_height = int(1024 / aspect_ratio)
-    else:  # Portrait
-        new_height = 1024
-        new_width = int(1024 * aspect_ratio)
-    
-    # Round to nearest multiple of 8
-    new_width = round(new_width / 8) * 8
-    new_height = round(new_height / 8) * 8
-    
-    # Ensure within valid range (minimum 256, maximum 1024)
-    new_width = max(256, min(1024, new_width))
-    new_height = max(256, min(1024, new_height))
-    
-    return new_width, new_height
 
-# Updated duration function to match generate_image arguments (including progress)
-def get_duration(prompt_embeds, image_list, width, height, num_inference_steps, guidance_scale, seed, progress=gr.Progress(track_tqdm=True)):
-    num_images = 0 if image_list is None else len(image_list)
-    step_duration = 1 + 0.8 * num_images
-    return max(65, num_inference_steps * step_duration + 10)
+def image_stats(image: Image.Image) -> Dict[str, np.ndarray]:
+    arr = np.asarray(image.resize((128, 128)), dtype=np.float32) / 255.0
+    mean_rgb = arr.reshape(-1, 3).mean(axis=0)
 
-@spaces.GPU(duration=get_duration)
-def generate_image(prompt_embeds, image_list, width, height, num_inference_steps, guidance_scale, seed, progress=gr.Progress(track_tqdm=True)):
-    # Move embeddings to GPU only when inside the GPU decorated function
-    prompt_embeds = prompt_embeds.to(device)
-    
-    generator = torch.Generator(device=device).manual_seed(seed)
-    
-    pipe_kwargs = {
-        "prompt_embeds": prompt_embeds,
-        "image": image_list,
-        "num_inference_steps": num_inference_steps,
-        "guidance_scale": guidance_scale,
-        "generator": generator,
-        "width": width,
-        "height": height,
+    # simple saturation/brightness proxies
+    maxc = arr.max(axis=2)
+    minc = arr.min(axis=2)
+    saturation = np.where(maxc == 0, 0, (maxc - minc) / maxc).mean()
+    brightness = maxc.mean()
+
+    return {
+        "mean_rgb": mean_rgb,
+        "saturation": np.array([saturation], dtype=np.float32),
+        "brightness": np.array([brightness], dtype=np.float32),
     }
-    
-    # Progress bar for the actual generation steps
-    if progress:
-        progress(0, desc="Starting generation...")
-        
-    image = pipe(**pipe_kwargs).images[0]
-    return image
 
-def infer(prompt, input_images=None, seed=42, randomize_seed=False, width=1024, height=1024, num_inference_steps=50, guidance_scale=2.5, prompt_upsampling=False, progress=gr.Progress(track_tqdm=True)):
-    
-    if randomize_seed:
-        seed = random.randint(0, MAX_SEED)
-    
-    # Prepare image list (convert None or empty gallery to None)
-    image_list = None
-    if input_images is not None and len(input_images) > 0:
-        image_list = []
-        for item in input_images:
-            image_list.append(item[0])
 
-    # 1. Upsampling (Network bound - No GPU needed)
-    final_prompt = prompt
-    if prompt_upsampling:
-        progress(0.05, desc="Upsampling prompt...")
-        final_prompt = upsample_prompt_logic(prompt, image_list)
-        print(f"Original Prompt: {prompt}")
-        print(f"Upsampled Prompt: {final_prompt}")
+def tokenize(text: str) -> List[str]:
+    return [w.lower() for w in WORD_RE.findall(text or "")]
 
-    # 2. Text Encoding (Network bound - No GPU needed)
-    progress(0.1, desc="Encoding prompt...")
-    # This returns CPU tensors
-    prompt_embeds = remote_text_encoder(final_prompt)
-    
-    # 3. Image Generation (GPU bound)
-    progress(0.3, desc="Waiting for GPU...")
-    image = generate_image(
-        prompt_embeds, 
-        image_list, 
-        width, 
-        height, 
-        num_inference_steps, 
-        guidance_scale, 
-        seed, 
-        progress
+
+def color_distance(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
+
+
+def choose_frame_palette(wall_stats: Dict[str, np.ndarray]) -> Dict[str, str]:
+    sat = float(wall_stats["saturation"][0])
+    bright = float(wall_stats["brightness"][0])
+
+    if bright > 0.72 and sat < 0.22:
+        return {"frame": "#2f2f2f", "mat": "#f3efe8", "name": "gallery black"}
+    if bright < 0.40:
+        return {"frame": "#c7a76a", "mat": "#f5f0e6", "name": "warm gold"}
+    if sat > 0.40:
+        return {"frame": "#faf7f2", "mat": "#ece6de", "name": "soft white"}
+    return {"frame": "#7a5332", "mat": "#f3ede4", "name": "classic walnut"}
+
+
+def score_art(prompt: str, wall_image: Image.Image) -> Tuple[ArtItem, Dict[str, float]]:
+    if not ART_LIBRARY:
+        raise gr.Error(f"No artworks found in '{ART_LIBRARY_DIR}'. Add image files to continue.")
+
+    wall_stats = image_stats(wall_image)
+    prompt_tokens = tokenize(prompt)
+
+    best_item = ART_LIBRARY[0]
+    best_score = -1e9
+    best_breakdown: Dict[str, float] = {}
+
+    for item in ART_LIBRARY:
+        art = load_rgb_image(item.path)
+        art_stats = image_stats(art)
+
+        tag_tokens = set(tokenize(item.title) + list(item.tags))
+        token_overlap = sum(1 for t in prompt_tokens if t in tag_tokens)
+        text_score = token_overlap / max(3, len(set(prompt_tokens)))
+
+        wall_art_dist = color_distance(wall_stats["mean_rgb"], art_stats["mean_rgb"])
+        # prefer moderate contrast so piece stands out but still fits
+        color_score = max(0.0, 1.0 - abs(wall_art_dist - 0.45))
+
+        sat_diff = abs(float(wall_stats["saturation"][0]) - float(art_stats["saturation"][0]))
+        style_score = max(0.0, 1.0 - sat_diff)
+
+        final_score = 0.55 * text_score + 0.30 * color_score + 0.15 * style_score
+
+        if final_score > best_score:
+            best_score = final_score
+            best_item = item
+            best_breakdown = {
+                "text": text_score,
+                "color": color_score,
+                "style": style_score,
+                "total": final_score,
+            }
+
+    return best_item, best_breakdown
+
+
+def build_framed_art(art: Image.Image, frame_hex: str, mat_hex: str, target_size: Tuple[int, int]) -> Image.Image:
+    target_w, target_h = target_size
+    art_fit = ImageOps.contain(art, (int(target_w * 0.78), int(target_h * 0.78)))
+
+    mat_pad = max(14, int(min(target_w, target_h) * 0.07))
+    frame_thickness = max(18, int(min(target_w, target_h) * 0.09))
+
+    mat_canvas = Image.new("RGB", (art_fit.width + mat_pad * 2, art_fit.height + mat_pad * 2), ImageColor.getrgb(mat_hex))
+    mat_canvas.paste(art_fit, (mat_pad, mat_pad))
+
+    framed = ImageOps.expand(mat_canvas, border=frame_thickness, fill=frame_hex)
+
+    # light bevel to make the frame feel less flat
+    overlay = Image.new("RGBA", framed.size, (0, 0, 0, 0))
+    ow, oh = framed.size
+    highlight = Image.new("RGBA", (ow, oh), (255, 255, 255, 0))
+    shadow = Image.new("RGBA", (ow, oh), (0, 0, 0, 0))
+
+    for y in range(oh):
+        alpha = int(40 * (1 - y / oh))
+        if alpha > 0:
+            highlight.paste((255, 255, 255, alpha), (0, y, ow, y + 1))
+        sa = int(38 * (y / oh))
+        if sa > 0:
+            shadow.paste((0, 0, 0, sa), (0, y, ow, y + 1))
+
+    overlay = Image.alpha_composite(overlay, highlight)
+    overlay = Image.alpha_composite(overlay, shadow)
+
+    framed_rgba = framed.convert("RGBA")
+    framed_rgba = Image.alpha_composite(framed_rgba, overlay)
+    return framed_rgba
+
+
+def place_on_wall(wall: Image.Image, framed_art: Image.Image) -> Image.Image:
+    wall = wall.convert("RGB")
+    wall_w, wall_h = wall.size
+
+    max_w = int(wall_w * 0.44)
+    max_h = int(wall_h * 0.56)
+    framed_fit = ImageOps.contain(framed_art, (max_w, max_h))
+
+    x = (wall_w - framed_fit.width) // 2
+    y = int(wall_h * 0.33) - framed_fit.height // 2
+    y = max(20, min(y, wall_h - framed_fit.height - 20))
+
+    canvas = wall.convert("RGBA")
+
+    shadow = Image.new("RGBA", framed_fit.size, (0, 0, 0, 130))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=max(6, framed_fit.width // 80)))
+    canvas.alpha_composite(shadow, (x + 10, y + 14))
+    canvas.alpha_composite(framed_fit, (x, y))
+
+    return canvas.convert("RGB")
+
+
+def infer(prompt: str, wall_photo: Image.Image):
+    if wall_photo is None:
+        raise gr.Error("Please upload a photo of your wall.")
+    if not prompt or not prompt.strip():
+        raise gr.Error("Please describe what you want in the artwork.")
+
+    wall = wall_photo.convert("RGB")
+    wall = ImageOps.contain(wall, (MAX_IMAGE_SIZE, MAX_IMAGE_SIZE))
+
+    selected_item, score = score_art(prompt, wall)
+    art = load_rgb_image(selected_item.path)
+
+    wall_stats = image_stats(wall)
+    frame_palette = choose_frame_palette(wall_stats)
+
+    framed_art = build_framed_art(
+        art,
+        frame_hex=frame_palette["frame"],
+        mat_hex=frame_palette["mat"],
+        target_size=(int(wall.width * 0.42), int(wall.height * 0.52)),
     )
-    
-    return image, seed
 
-examples = [
-    ["Create a vase on a table in living room, the color of the vase is a gradient of color, starting with #02eb3c color and finishing with #edfa3c. The flowers inside the vase have the color #ff0088"],
-    ["Photorealistic infographic showing the complete Berlin TV Tower (Fernsehturm) from ground base to antenna tip, full vertical view with entire structure visible including concrete shaft, metallic sphere, and antenna spire. Slight upward perspective angle looking up toward the iconic sphere, perfectly centered on clean white background. Left side labels with thin horizontal connector lines: the text '368m' in extra large bold dark grey numerals (#2D3748) positioned at exactly the antenna tip with 'TOTAL HEIGHT' in small caps below. The text '207m' in extra large bold with 'TELECAFÉ' in small caps below, with connector line touching the sphere precisely at the window level. Right side label with horizontal connector line touching the sphere's equator: the text '32m' in extra large bold dark grey numerals with 'SPHERE DIAMETER' in small caps below. Bottom section arranged in three balanced columns: Left - Large text '986' in extra bold dark grey with 'STEPS' in caps below. Center - 'BERLIN TV TOWER' in bold caps with 'FERNSEHTURM' in lighter weight below. Right - 'INAUGURATED' in bold caps with 'OCTOBER 3, 1969' below. All typography in modern sans-serif font (such as Inter or Helvetica), color #2D3748, clean minimal technical diagram style. Horizontal connector lines are thin, precise, and clearly visible, touching the tower structure at exact corresponding measurement points. Professional architectural elevation drawing aesthetic with dynamic low angle perspective creating sense of height and grandeur, poster-ready infographic design with perfect visual hierarchy."],
-    ["Soaking wet capybara taking shelter under a banana leaf in the rainy jungle, close up photo"],
-    ["A kawaii die-cut sticker of a chubby orange cat, featuring big sparkly eyes and a happy smile with paws raised in greeting and a heart-shaped pink nose. The design should have smooth rounded lines with black outlines and soft gradient shading with pink cheeks."],
+    placed = place_on_wall(wall, framed_art)
+
+    details = (
+        f"### Selected artwork: **{selected_item.title}**\n"
+        f"- Frame style: **{frame_palette['name']}**\n"
+        f"- Match score: **{score['total']:.2f}** (text {score['text']:.2f}, color {score['color']:.2f}, style {score['style']:.2f})\n"
+        f"- Source file: `{selected_item.path}`"
+    )
+
+    return placed, art, details
+
+
+EXAMPLES = [
+    ["I want a cozy pet-themed picture that feels warm and homely", "art_library/cat_window.webp"],
+    ["Give me a tropical wildlife piece with vibrant nature colors", "art_library/bird.webp"],
+    ["I need an elegant modern portrait for a stylish interior wall", "art_library/woman2.webp"],
 ]
 
-examples_images = [
-    # ["Replace the top of the person from image 1 with the one from image 2", ["person1.webp", "woman2.webp"]],
-    ["The person from image 1 is petting the cat from image 2, the bird from image 3 is next to them", ["woman1.webp", "cat_window.webp", "bird.webp"]]
-]
 
-css="""
-#col-container {
-    margin: 0 auto;
-    max-width: 1200px;
-}
-.gallery-container img{
-    object-fit: contain;
-}
+css = """
+#col-container {max-width: 1100px; margin: 0 auto;}
 """
 
-with gr.Blocks() as demo:
-    
+
+with gr.Blocks(css=css) as demo:
     with gr.Column(elem_id="col-container"):
-        gr.Markdown(f"""# FLUX.2 [dev]
-FLUX.2 [dev] is a 32B model rectified flow capable of generating, editing and combining images based on text instructions model [[model](https://huggingface.co/black-forest-labs/FLUX.2-dev)], [[blog](https://bfl.ai/blog/flux-2)]
-        """)
+        gr.Markdown(
+            """
+# Smart Wall Art Matcher
+Upload a wall photo and describe the mood/subject you want. The app picks the best artwork from its local library,
+generates a fitting frame style, and places it on your wall preview.
+"""
+        )
+
         with gr.Row():
-            with gr.Column():
-                with gr.Row():
-                    prompt = gr.Text(
-                        label="Prompt",
-                        show_label=False,
-                        max_lines=2,
-                        placeholder="Enter your prompt",
-                        container=False,
-                        scale=3
-                    )
-                    
-                    run_button = gr.Button("Run", scale=1)
-                    
-                with gr.Accordion("Input image(s) (optional)", open=True):
-                    input_images = gr.Gallery(
-                        label="Input Image(s)",
-                        type="pil",
-                        columns=3,
-                        rows=1,
-                    )
-                
-                with gr.Accordion("Advanced Settings", open=False):
-                    prompt_upsampling = gr.Checkbox(
-                        label="Prompt Upsampling",
-                        value=True,
-                        info="Automatically enhance the prompt using a VLM"
-                    )
-        
-                    seed = gr.Slider(
-                        label="Seed",
-                        minimum=0,
-                        maximum=MAX_SEED,
-                        step=1,
-                        value=0,
-                    )
-                    
-                    randomize_seed = gr.Checkbox(label="Randomize seed", value=True)
-                    
-                    with gr.Row():
-                        
-                        width = gr.Slider(
-                            label="Width",
-                            minimum=256,
-                            maximum=MAX_IMAGE_SIZE,
-                            step=8,
-                            value=1024,
-                        )
-                        
-                        height = gr.Slider(
-                            label="Height",
-                            minimum=256,
-                            maximum=MAX_IMAGE_SIZE,
-                            step=8,
-                            value=1024,
-                        )
-                    
-                    with gr.Row():
-                        
-                        num_inference_steps = gr.Slider(
-                            label="Number of inference steps",
-                            minimum=1,
-                            maximum=100,
-                            step=1,
-                            value=30,
-                        )
-                        
-                        guidance_scale = gr.Slider(
-                            label="Guidance scale",
-                            minimum=0.0,
-                            maximum=10.0,
-                            step=0.1,
-                            value=4,
-                        )
-                
-                
-            with gr.Column():
-                result = gr.Image(label="Result", show_label=False)
-            
-        
-        gr.Examples(
-            examples=examples,
-            fn=infer,
-            inputs=[prompt],
-            outputs=[result, seed],
-            cache_examples=True,
-            cache_mode="lazy"
-        )
+            with gr.Column(scale=1):
+                prompt = gr.Textbox(
+                    label="Describe the artwork you want",
+                    placeholder="Example: modern portrait with soft neutral tones",
+                )
+                wall_photo = gr.Image(label="Upload wall photo", type="pil")
+                run_button = gr.Button("Match and Place Artwork", variant="primary")
+
+            with gr.Column(scale=1):
+                result = gr.Image(label="Framed artwork on your wall", type="pil")
+                selected_art = gr.Image(label="Selected library artwork", type="pil")
+                details = gr.Markdown(label="Selection details")
 
         gr.Examples(
-            examples=examples_images,
+            examples=EXAMPLES,
+            inputs=[prompt, wall_photo],
+            outputs=[result, selected_art, details],
             fn=infer,
-            inputs=[prompt, input_images],
-            outputs=[result, seed],
-            cache_examples=True,
-            cache_mode="lazy"
+            cache_examples=False,
         )
 
-    # Auto-update dimensions when images are uploaded
-    input_images.upload(
-        fn=update_dimensions_from_image,
-        inputs=[input_images],
-        outputs=[width, height]
-    )
+        run_button.click(
+            fn=infer,
+            inputs=[prompt, wall_photo],
+            outputs=[result, selected_art, details],
+        )
 
-    gr.on(
-        triggers=[run_button.click, prompt.submit],
-        fn=infer,
-        inputs=[prompt, input_images, seed, randomize_seed, width, height, num_inference_steps, guidance_scale, prompt_upsampling],
-        outputs=[result, seed]
-    )
-
-demo.launch(css=css)
+demo.launch()
